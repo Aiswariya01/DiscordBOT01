@@ -2,11 +2,12 @@ import discord
 from discord.ext import commands, tasks
 import asyncio
 import datetime
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import yt_dlp
 import os
 import google.generativeai as genai
 from dotenv import load_dotenv
+from collections import deque
 
 # Load environment variables
 load_dotenv()
@@ -23,8 +24,20 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Store reminders
 reminders = {}
+# Music Queue
+music_queue = deque()
 
-###  Chatbot Command
+### Startup Message
+@bot.event
+async def on_ready():
+    print(f"✅ Bot is online as {bot.user}")
+    cleanup_reminders.start()
+    for guild in bot.guilds:
+        for channel in guild.text_channels:
+            await channel.send("🤖 Bot is now online and ready to assist! 🚀")
+            break
+
+### Chat Command
 @bot.command()
 async def chat(ctx, *, message):
     """Chat with the AI"""
@@ -34,41 +47,26 @@ async def chat(ctx, *, message):
     except Exception as e:
         await ctx.send(f"Error: {e}")
 
-###  Reminders
+### Reminders
 @bot.command()
 async def remind(ctx, minutes: int, *, reminder):
     """Set a reminder"""
-    remind_time = datetime.now(timezone.utc) + datetime.timedelta(minutes=minutes)
-    reminders[ctx.author.id] = (remind_time, reminder)
-    await ctx.send(f"Reminder set for {minutes} minutes.")
-
-@bot.command()
-async def myreminders(ctx):
-    """List user reminders"""
-    user_reminders = [f"{r[1]} at {r[0]}" for uid, r in reminders.items() if uid == ctx.author.id]
-    await ctx.send("\n".join(user_reminders) if user_reminders else "No reminders set.")
-
-@bot.command()
-async def delreminder(ctx):
-    """Delete user's reminders"""
-    if ctx.author.id in reminders:
-        del reminders[ctx.author.id]
-        await ctx.send("Reminder deleted.")
-    else:
-        await ctx.send("No reminders found.")
+    remind_time = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+    reminders[(ctx.author.id, ctx.channel.id)] = (remind_time, reminder)
+    await ctx.send(f"⏳ Reminder set for {minutes} minutes.")
 
 @tasks.loop(minutes=1)
 async def cleanup_reminders():
     """Auto-delete expired reminders"""
     now = datetime.now(timezone.utc)
-    expired = [uid for uid, r in reminders.items() if r[0] < now]
-    for uid in expired:
-        user = bot.get_user(uid)
-        if user:
-            await user.send(f"Reminder: {reminders[uid][1]}")
-        del reminders[uid]
+    expired = [(uid, cid) for (uid, cid), r in reminders.items() if r[0] < now]
+    for uid, cid in expired:
+        channel = bot.get_channel(cid)
+        if channel:
+            await channel.send(f"🔔 Reminder: {reminders[(uid, cid)][1]}")
+        del reminders[(uid, cid)]
 
-###  Polls
+### Polls
 @bot.command()
 async def poll(ctx, question, *options):
     """Create a poll"""
@@ -81,7 +79,7 @@ async def poll(ctx, question, *options):
     for i in range(len(options)):
         await message.add_reaction(reactions[i])
 
-###  Summarization
+### Summarization
 @bot.command()
 async def summarize(ctx, *, text):
     """Summarize long text using AI"""
@@ -91,7 +89,7 @@ async def summarize(ctx, *, text):
     except Exception as e:
         await ctx.send(f"Error: {e}")
 
-###  Music Player
+### Music System
 @bot.command()
 async def play(ctx, url):
     """Play music from YouTube"""
@@ -99,27 +97,33 @@ async def play(ctx, url):
         channel = ctx.author.voice.channel
         if ctx.voice_client is None:
             await channel.connect()
-        ydl_opts = {'format': 'bestaudio'}
+        ydl_opts = {'format': 'bestaudio', 'noplaylist': True}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             url2 = info['url']
-        vc = ctx.voice_client
-        vc.stop()
-        vc.play(discord.FFmpegPCMAudio(url2))
-        await ctx.send(f"🎵 Playing {info['title']}")
+        music_queue.append((url2, info['title']))
+        await ctx.send(f"🎵 Added to queue: {info['title']}")
+        if not ctx.voice_client.is_playing():
+            await play_next(ctx)
     else:
         await ctx.send("Join a voice channel first!")
+
+async def play_next(ctx):
+    if music_queue:
+        url, title = music_queue.popleft()
+        ctx.voice_client.stop()
+        ctx.voice_client.play(discord.FFmpegPCMAudio(url), after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop))
+        await ctx.send(f"🎵 Now playing: {title}")
 
 @bot.command()
 async def stop(ctx):
     """Stop music"""
     if ctx.voice_client:
         await ctx.voice_client.disconnect()
-        await ctx.send("Stopped music.")
-    else:
-        await ctx.send("Bot is not in a voice channel.")
+        music_queue.clear()
+        await ctx.send("Stopped music and cleared queue.")
 
-###  Welcome Message
+### Custom Welcome Message
 @bot.event
 async def on_member_join(member):
     """Send a welcome message when a new member joins"""
@@ -127,12 +131,7 @@ async def on_member_join(member):
     if channel:
         await channel.send(f"Welcome {member.mention} to {member.guild.name}! 🎉")
 
-###  Start Bot
-@bot.event
-async def on_ready():
-    print(f"Bot is online as {bot.user}")
-    cleanup_reminders.start()
-
+### Start Bot
 async def main():
     async with bot:
         await bot.start(DISCORD_TOKEN)
